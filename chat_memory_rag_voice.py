@@ -50,8 +50,9 @@ _model = None
 def get_model():
     global _model
     if _model is None:
-        logging.info("Loading embedding model...")
+        logging.info("Loading embedding model (preload)...")
         _model = SentenceTransformer(EMBEDDING_MODEL)
+        logging.info("Embedding model loaded and ready.")
     return _model
 
 def embed(text: str) -> List[float]:
@@ -89,6 +90,34 @@ def ensure_db():
     conn.close()
     logging.info("Database initialized and verified.")
 
+# ========= Warm-Up Function =========
+def warmup_environment():
+    """
+    Preloads heavy resources before microphone loop starts:
+      - Embedding model
+      - SQLite + vec0 extension
+      - Basic DB connection check
+      - Tiny dummy embedding to prime PyTorch
+    """
+    start = time.time()
+    logging.info("Performing system warm-up...")
+
+    ensure_db()
+    model = get_model()
+    _ = model.encode("warmup test", normalize_embeddings=True)
+    logging.info("Model embedding warm-up complete.")
+
+    conn = sqlite3.connect(DB_FILE)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    conn.execute(f"SELECT count(*) FROM {META_TABLE}")
+    conn.close()
+    logging.info("SQLite vec0 warm-up complete.")
+
+    logging.info(f"Warm-up finished in {time.time() - start:.2f} seconds.")
+
+# ========= Memory & RAG Functions =========
 def remember(conn: sqlite3.Connection, role: str, text: str) -> None:
     vec = embed(text)
     cur = conn.execute(
@@ -193,7 +222,7 @@ def build_rag_prompt(memory_block: str, user_text: str, facts: dict) -> str:
         "Respond in one short, natural sentence addressed to the USER."
     )
 
-# ========= Main loop =========
+# ========= Main Loop =========
 def listen_and_recognize():
     logging.info(f"Starting AVA Voice Assistant on Python {sys.version}")
     ensure_db()
@@ -202,76 +231,82 @@ def listen_and_recognize():
     tts_engine = pyttsx3.init()
     tts_engine.setProperty('volume', 1.0)
 
-    print("Say something...")
-    while True:
-        try:
-            with sr.Microphone() as source:
+    with sr.Microphone() as source:
+        logging.info("Calibrating ambient noise level...")
+        recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_NOISE_DURATION)
+        logging.info(f"Energy threshold set to: {recognizer.energy_threshold:.2f}")
+        print("Get Ready to Say something when I say I am Listening...")
+
+        while True:
+            try:
                 print("Listening...")
-                recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_NOISE_DURATION)
                 audio = recognizer.listen(source, timeout=None, phrase_time_limit=PHRASE_TIME_LIMIT)
 
-            text = recognizer.recognize_google(audio)
-            logging.info(f"User said: {text}")
+                if len(audio.frame_data) == 0:
+                    logging.warning("Captured empty audio; skipping.")
+                    continue
 
-            conn = sqlite3.connect(DB_FILE)
-            conn.enable_load_extension(True)
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
+                text = recognizer.recognize_google(audio)
+                logging.info(f"User said: {text}")
 
-            extract_and_store_facts(conn, text)
-            hits = recall(conn, text, TOP_K)
-            facts = get_all_facts(conn)
-            memory_block = format_memory_snippets(hits)
+                conn = sqlite3.connect(DB_FILE)
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
 
-            constrained_prompt = build_rag_prompt(memory_block, text, facts)
-            payload = {
-                "prompt": constrained_prompt,
-                "model": OLLAMA_MODEL,
-                "stream": OLLAMA_STREAM,
-                "temperature": OLLAMA_TEMPERATURE,
-                "max_tokens": OLLAMA_MAX_TOKENS
-            }
+                extract_and_store_facts(conn, text)
+                hits = recall(conn, text, TOP_K)
+                facts = get_all_facts(conn)
+                memory_block = format_memory_snippets(hits)
 
-            response = requests.post(OLLAMA_ENDPOINT, json=payload, timeout=HTTP_TIMEOUT)
-            text_response = "Sorry, there was an error from the model."
+                constrained_prompt = build_rag_prompt(memory_block, text, facts)
+                payload = {
+                    "prompt": constrained_prompt,
+                    "model": OLLAMA_MODEL,
+                    "stream": OLLAMA_STREAM,
+                    "temperature": OLLAMA_TEMPERATURE,
+                    "max_tokens": OLLAMA_MAX_TOKENS
+                }
 
-            if response.status_code == 200:
-                result = response.json()
-                text_response = result.get("response", "").strip()
-                logging.info(f"Ollama response: {text_response}")
-            else:
-                logging.error(f"Ollama error {response.status_code}: {response.text}")
-                text_response = f"Error {response.status_code}"
+                response = requests.post(OLLAMA_ENDPOINT, json=payload, timeout=HTTP_TIMEOUT)
+                text_response = "Sorry, there was an error from the model."
 
-            remember(conn, "user", text)
-            remember(conn, "assistant", text_response)
-            conn.close()
+                if response.status_code == 200:
+                    result = response.json()
+                    text_response = result.get("response", "").strip()
+                    logging.info(f"Ollama response: {text_response}")
+                else:
+                    logging.error(f"Ollama error {response.status_code}: {response.text}")
+                    text_response = f"Error {response.status_code}"
 
-            tts_engine.say(text_response)
-            tts_engine.runAndWait()
-            tts_engine.stop()
-            time.sleep(0.15)
+                remember(conn, "user", text)
+                remember(conn, "assistant", text_response)
+                conn.close()
 
-        except sr.UnknownValueError:
-            logging.warning("Speech not recognized.")
-            time.sleep(0.2)
-            continue
-        except sr.RequestError as e:
-            logging.error(f"Speech Recognition API error: {e}")
-            time.sleep(0.3)
-            continue
-        except KeyboardInterrupt:
-            logging.info("User interrupted. Exiting.")
-            break
-        except Exception as e:
-            logging.exception(f"Unexpected error: {e}")
-            time.sleep(0.3)
-            continue
+                # Voice output
+                tts_engine.say(text_response)
+                tts_engine.runAndWait()
+                tts_engine.stop()
+
+            except sr.UnknownValueError:
+                logging.warning("Speech not recognized (low confidence).")
+                continue
+            except sr.RequestError as e:
+                logging.error(f"Speech Recognition API error: {e}")
+                continue
+            except KeyboardInterrupt:
+                logging.info("User interrupted. Exiting.")
+                break
+            except Exception as e:
+                logging.exception(f"Unexpected error: {e}")
+                continue
 
     try:
         tts_engine.stop()
     except Exception:
         pass
 
+# ========= Entry Point =========
 if __name__ == "__main__":
+    warmup_environment()
     listen_and_recognize()
