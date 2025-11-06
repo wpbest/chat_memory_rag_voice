@@ -177,10 +177,10 @@ def extract_and_store_facts(conn: sqlite3.Connection, user_text: str) -> None:
                 upsert_fact(conn, "age", m5.group(1))
 
 # ========= Prompt builder (updated for assistant identity) =========
-def build_rag_prompt(memory_block: str, user_text: str, facts: Dict[str, str]) -> str:
+def build_rag_prompt(memory_block: str, user_text: str, facts: dict) -> str:
     """
-    Build a contextual prompt that clearly distinguishes between the USER (the human)
-    and the ASSISTANT (you, named AVA).  Facts always belong to the USER only.
+    Builds a perspective-aware RAG prompt without hard-coding specific facts.
+    It teaches the model the correct speaker roles and pronoun mapping dynamically.
     """
     facts_block = "None."
     if facts:
@@ -188,14 +188,16 @@ def build_rag_prompt(memory_block: str, user_text: str, facts: Dict[str, str]) -
 
     return (
         "System role definition:\n"
-        "You are an AI voice assistant named AVA.\n"
-        "You are *not* the USER. The USER is the human speaking to you.\n"
-        "Facts listed below belong to the USER only — never to you.\n"
-        "You must never copy the USER's age, name, or identity when describing yourself.\n"
-        "When asked 'How old are you?', say you do not have an age.\n"
-        "When asked 'What is your name?', say 'My name is AVA.'\n"
-        "When asked 'What is my name?' or 'How old am I?', use the USER's facts.\n\n"
-        f"USER facts (authoritative):\n{facts_block}\n\n"
+        "You are an AI assistant named AVA, speaking to the USER (the human).\n"
+        "You are distinct from the USER and never share the USER’s attributes.\n"
+        "Facts listed below describe the USER only.\n"
+        "Maintain correct conversational perspective at all times:\n"
+        " - When the USER says 'my', interpret that as referring to the USER.\n"
+        " - When the USER says 'your', interpret that as referring to AVA.\n"
+        " - When responding, use pronouns consistent with natural dialogue "
+        "(e.g., 'your' for USER attributes, 'my' for your own attributes).\n"
+        "Do not copy or claim any USER fact as your own identity or property.\n\n"
+        f"USER facts:\n{facts_block}\n\n"
         f"Recalled conversation snippets:\n{memory_block}\n\n"
         f"USER says: {user_text}\n"
         "Respond in one short, natural sentence addressed to the USER."
