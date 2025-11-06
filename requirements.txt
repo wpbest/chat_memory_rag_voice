@@ -1,0 +1,15 @@
+# Core dependencies
+speechrecognition==3.10.1
+pyttsx3==2.90
+requests==2.32.3
+
+# Vector + embeddings
+sentence-transformers==3.0.1
+sqlite-vec==0.1.5
+
+# Audio input (microphone support)
+pyaudio==0.2.14
+
+# Optional: for numerical ops (used internally by transformers)
+numpy>=1.26.0
+torch>=2.3.0
